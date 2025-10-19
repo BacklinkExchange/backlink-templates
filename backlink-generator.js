@@ -1,491 +1,521 @@
-(() => {
-  // ——— DEFAULT TEMPLATES —————————————————————————————————————————————
-  let backlinkTemplates = [
-    'https://www.facebook.com/sharer/sharer.php?u=[ENCODE_URL]',
-    'https://twitter.com/intent/tweet?url=[ENCODE_URL]&text=[ENCODE_TITLE]',
-    'https://www.linkedin.com/shareArticle?mini=true&url=[ENCODE_URL]&title=[ENCODE_TITLE]',
-    'https://www.reddit.com/submit?url=[ENCODE_URL]&title=[ENCODE_TITLE]',
-    'http://pinterest.com/pin/create/button/?url=[ENCODE_URL]&media=&description=',
-    'https://www.tumblr.com/widgets/share/tool?canonicalUrl=[ENCODE_URL]&title=[ENCODE_TITLE]&caption=[ENCODE_TITLE]',
-    'https://vk.com/share.php?url=[ENCODE_URL]&title=[ENCODE_TITLE]',
-    'http://service.weibo.com/share/share.php?url=[ENCODE_URL]&title=[ENCODE_TITLE]&pic=',
-    'https://mix.com/add?url=[ENCODE_URL]'
-  ];
-  let youtubeBacklinkTemplates = [
-    'https://video.ultra-zone.net/watch.en.html.gz?v=[ID]',
-    'https://www.ytrepeat.com/watch/?v=[ID]',
-    'https://sec.pn.to/jump.php?https://youtube.com/watch?v=[ID]'
-  ];
-  
-  // Add near the top of your script, alongside backlinkTemplates:
-  let corsProxiesTemplates = [
-    'https://api.allorigins.win/raw?url=[ENCODE_URL]'
-  ];
-  
-  
-  let templatesLoaded = false;
+// backlink-generator.js (final v6.1)
+// - Fix: popup/tab with "Reuse same window/tab" now truly reuses the same window in ARCHIVE_TLDS variant runner
+// - Generalized archive.* per-URL variant logic (stop after first success)
+// - Robust Stop (runToken guards, timers cleared, close popups/iframes), strict timeout handling
+// - Blogger-safe ENCODE handling, CORS Ping first-success, 'Welcome to nginx' detection for archive.*
 
-  /*
-  // ——— FETCH UP‑TO‑DATE TEMPLATES —————————————————————————————————————
-  async function loadBacklinkTemplates() {
-    try {
-      const [res1, res2] = await Promise.all([
-        fetch("https://backlinkexchange.github.io/backlink-templates/backlink-templates.json"),
-        fetch("https://backlinkexchange.github.io/backlink-templates/youtube-backlink-templates.json")
-      ]);
-      if (!res1.ok || !res2.ok) throw new Error('Failed to fetch templates');
-      const t1 = await res1.json();
-      const t2 = await res2.json();
-      if (Array.isArray(t1)) backlinkTemplates = t1;
-      if (Array.isArray(t2)) youtubeBacklinkTemplates = t2;
-      
-      // —— NEW: fetch CORS proxy list ——
-      const corsRes = await fetch(
-        'https://backlinkexchange.github.io/backlink-templates/cors-proxies.json'
-      );
-      if (corsRes.ok) {
-        const corsList = await corsRes.json();
-        if (Array.isArray(corsList)) {
-          corsProxiesTemplates = corsList;
+let backlinkTemplates = ['https://www.facebook.com/sharer/sharer.php?u=[ENCODE_URL]', 'https://twitter.com/intent/tweet?url=[ENCODE_URL]&text=[ENCODE_TITLE]'],
+    youtubeBacklinkTemplates = ['https://video.ultra-zone.net/watch.en.html.gz?v=[ID]', 'https://video.ultra-zone.net/watch.en.html.gz?v={{ID}}'],
+    corsProxiesTemplates = ['https://api.allorigins.win/raw?url=[ENCODE_URL]'];
+
+const ARCHIVE_TLDS = ["archive.today","archive.li","archive.vn","archive.fo","archive.md","archive.ph","archive.is"];
+
+// Run control for Stop
+let runToken = 0;
+let rerunTimer = null;
+const activeIframes = new Set();
+const activeWindows = new Set();
+
+async function loadTemplates(){
+  try {
+    const [r1,r2,r3]=await Promise.all([
+      fetch('https://backlink-generator-tool.github.io/backlink-generator-tool/backlink-templates.json'),
+      fetch('https://backlink-generator-tool.github.io/backlink-generator-tool/youtube-backlink-templates.json'),
+      fetch('https://backlink-generator-tool.github.io/backlink-generator-tool/cors-proxies.json')
+    ]);
+    if(r1.ok) backlinkTemplates=await r1.json();
+    if(r2.ok) youtubeBacklinkTemplates=await r2.json();
+    if(r3.ok) corsProxiesTemplates=await r3.json();
+  } catch(e){console.warn('Failed to load remote templates:', e);}
+}
+
+function normalizeUrl(raw){
+  try{
+    let u = raw.trim();
+    if(!/^https?:\/\//i.test(u)) u = 'https://' + u;
+    const p = new URL(u);
+    p.hostname = p.hostname.replace(/^www\./i,'');
+    if(!p.pathname || p.pathname === '/') p.pathname = '';
+    return p.toString();
+  } catch {return null;}
+}
+
+function buildMap(url, vid) {
+  const p = new URL(url);
+  const parts = p.hostname.split('.');
+  const ln = parts.length;
+
+  const hostnameNoWWW = p.hostname.replace(/^www\./i,'');
+  let map = {
+    PROTOCOL: p.protocol,
+    SUBDOMAIN: ln > 2 ? parts.slice(0, ln - 2).join('.') + '.' : '',
+    DOMAINNAME: parts[ln - 2] || '',
+    TLD: parts[ln - 1] || '',
+    HOST: p.hostname,
+    PORT: p.port ? ':' + p.port : '',
+    PATH: p.pathname,
+    QUERY: p.search,
+    PARAMS: p.search ? p.search.slice(1) : '',
+    FRAGMENT: p.hash,
+    URL: url,
+    DOMAIN: p.hostname,
+    NOPROTOCOL_URL: `${p.hostname}${p.pathname}${p.search}${p.hash}`,
+    NOSUBDOMAIN_URL: `${hostnameNoWWW}${p.pathname}${p.search}${p.hash}`
+  };
+  if (vid) map.ID = vid;
+
+  Object.keys(map).forEach(k=>{
+    try{map['ENCODE_'+k]=encodeURIComponent(map[k]);}
+    catch{map['ENCODE_'+k]='';}
+  });
+  return map;
+}
+
+function replacePlaceholders(tpl, map) {
+  return tpl.replace(/(\{\{|\[)\s*(ENCODE_)?([A-Z0-9_]+)\s*(\}\}|\])/gi,
+    (match,open,encPrefix,key,close,offset,fullStr)=>{
+      if(!key)return'';
+      key=key.toUpperCase();
+      const wantsEncode=!!encPrefix;
+      if(wantsEncode){
+        const encodedKey='ENCODE_'+key;
+        if(map.hasOwnProperty(encodedKey))return map[encodedKey];
+        try{return encodeURIComponent(map[key]||'');}catch{return'';}
+      }
+      if(key==='URL'){
+        const before=fullStr.slice(Math.max(0,offset-30),offset).toLowerCase();
+        if(/\burl\s*=\s*$/.test(before)||/\burl\s*=\s*/i.test(fullStr)){
+          try{return encodeURIComponent(map['URL']||'');}catch{return map['URL']||'';}
         }
       }
-    } catch (err) {
-      console.error('Error loading templates, using defaults:', err);
-    } finally {
-      templatesLoaded = true;
-    }
-  }
-  */
-  
-  async function loadBacklinkTemplates() {
-  console.debug('⏳ Loading backlink templates...');
+      return map[key]||'';
+  });
+}
 
+function generateUrl(tpl, normUrl, vid){
+  if(!tpl)return'';
+  tpl=tpl
+    .replace(/%5B\s*(ENCODE_)?([A-Z0-9_]+)\s*%5D/gi,'[$1$2]')
+    .replace(/&#(?:x5b|91);\s*(ENCODE_)?([A-Z0-9_]+)\s*&#(?:x5d|93);/gi,'[$1$2]')
+    .replace(/\{\{\s*(ENCODE_)?([A-Z0-9_]+)\s*\}\}/gi,'[$1$2]')
+    .replace(/%7B%7B\s*(ENCODE_)?([A-Z0-9_]+)\s*%7D%7D/gi,'[$1$2]');
+  const map=buildMap(normUrl,vid);
+  return replacePlaceholders(tpl,map);
+}
+
+// === Generalized ARCHIVE_TLDS helpers ===
+function isArchiveHost(hostname){
+  const h = (hostname||'').toLowerCase();
+  return ARCHIVE_TLDS.includes(h);
+}
+
+function buildArchiveUrlVariants(finalUrl){
+  try{
+    const u = new URL(finalUrl);
+    if(!isArchiveHost(u.hostname)) return null;
+    return ARCHIVE_TLDS.map(tld => {
+      const v = new URL(finalUrl);
+      v.hostname = tld;
+      return v.toString();
+    });
+  }catch{return null;}
+}
+
+// Settings & UI wires
+function saveSettings(){ const s={mode:modeSelect.value,reuse:reuseToggle.value,conc:concurrencyRange.value,rerun:rerunCheckbox.checked,shuffle:shuffleCheckbox.checked}; document.cookie='bg='+encodeURIComponent(JSON.stringify(s))+';path=/;max-age=31536000'; }
+function loadSettings(){
+  const c=document.cookie.split(';').map(x=>x.trim()).find(x=>x.startsWith('bg='));
+  if(c) try{const s=JSON.parse(decodeURIComponent(c.slice(3)));modeSelect.value=s.mode||'iframe';reuseToggle.value=s.reuse||'fresh';concurrencyRange.value=s.conc||5;rerunCheckbox.checked=s.rerun!==false;shuffleCheckbox.checked=s.shuffle!==false;concurrentCount.textContent=concurrencyRange.value;return;}catch{}
+  modeSelect.value='iframe';reuseToggle.value='fresh';concurrencyRange.value=5;rerunCheckbox.checked=false;shuffleCheckbox.checked=true;concurrentCount.textContent=5;saveSettings();
+}
+
+const urlInput=document.getElementById('urlInput'),
+      startBtn=document.getElementById('startBtn'),
+      toggleAdv=document.getElementById('toggleAdvancedBtn'),
+      advPanel=document.getElementById('advancedPanel'),
+      modeSelect=document.getElementById('modeSelect'),
+      reuseToggle=document.getElementById('reuseToggle'),
+      concurrencyRange=document.getElementById('concurrencyRange'),
+      concurrentCount=document.getElementById('concurrentCount'),
+      rerunCheckbox=document.getElementById('rerunCheckbox'),
+      shuffleCheckbox=document.getElementById('shuffleCheckbox'),
+      newUrlInput=document.getElementById('newUrl'),
+      copyBtn=document.getElementById('copyBtn'),
+      downloadBtn=document.getElementById('downloadBtn'),
+      progressBar=document.getElementById('progressBar'),
+      progressText=document.getElementById('progressText'),
+      resultsUl=document.getElementById('results'),
+      externalLink=document.getElementById('externalLink');
+
+function updateReuseToggleState() {
+  reuseToggle.disabled = !(modeSelect.value === 'popup' || modeSelect.value === 'tab');
+}
+modeSelect.addEventListener('change', updateReuseToggleState);
+
+[modeSelect,reuseToggle,concurrencyRange,rerunCheckbox,shuffleCheckbox].forEach(el=>el.addEventListener('change',saveSettings));
+concurrencyRange.addEventListener('input',()=>{ concurrentCount.textContent=concurrencyRange.value; saveSettings(); });
+toggleAdv.addEventListener('click',()=>{ advPanel.style.display = advPanel.style.display==='none' ? 'block' : 'none'; });
+startBtn.addEventListener('click',()=> running ? stopRun() : startRun());
+copyBtn.addEventListener('click',()=>{ newUrlInput.select(); document.execCommand('copy'); });
+
+let running=false, queue=[], slots=[], totalTasks=0, doneCount=0;
+function updateProgress(){
+  const pct = totalTasks ? Math.round(doneCount/totalTasks*100) : 0;
+  progressBar.style.width = pct + '%';
+  progressText.textContent = `${doneCount}/${totalTasks} (${pct}%)`;
+}
+
+async function fetchWithTimeout(resource, timeout = 5000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
   try {
-    // Parallel fetch for main templates
-    const [res1, res2] = await Promise.all([
-      fetch("https://backlinkexchange.github.io/backlink-templates/backlink-templates.json"),
-      fetch("https://backlinkexchange.github.io/backlink-templates/youtube-backlink-templates.json")
-    ]);
-
-    if (res1.ok) {
-      const data1 = await res1.json();
-      if (Array.isArray(data1)) {
-        backlinkTemplates = data1;
-      } 
-    } 
-
-    if (res2.ok) {
-      const data2 = await res2.json();
-      if (Array.isArray(data2)) {
-        youtubeBacklinkTemplates = data2;
-      } 
-    } 
-
-    // Optional: load CORS proxies
-    try {
-      const corsRes = await fetch(
-        'https://backlinkexchange.github.io/backlink-templates/cors-proxies.json'
-      );
-      if (corsRes.ok) {
-        const corsList = await corsRes.json();
-        if (Array.isArray(corsList)) {
-          corsProxiesTemplates = corsList;
-        } 
-      } 
-    } catch (corsErr) {
-    }
-
+    const res = await fetch(resource, { signal: controller.signal });
+    clearTimeout(id);
+    return res;
   } catch (err) {
-  } finally {
-    templatesLoaded = true
+    clearTimeout(id);
+    return { ok: false, __error: err };
   }
 }
-  
-  document.addEventListener('DOMContentLoaded', async () => {
-    await loadBacklinkTemplates();
 
-    // ——— STATE & ELEMENTS —————————————————————————————————————
-    let running = false;
-    let total = 0, completed = 0, failed = 0;
-    let urlQueue = [];
-    let slots = [];
-    let popupBlocked = false;
-    let currentMap = null;
+function isActive(slot){ return running && slot && slot.token === runToken; }
 
-    const settings = { mode: 'iframe', concurrency: 5, rerun: false, shuffle: true };
-    const el = id => document.getElementById(id);
-    const urlInput         = el('urlInput');
-    const startBtn         = el('startBtn');
-    const toggleBtn        = el('toggleAdvancedBtn');
-    const advPanel         = el('advancedPanel');
-    const modeSelect       = el('modeSelect');
-    const concurrencyRange = el('concurrencyRange');
-    const concurrentCount  = el('concurrentCount');
-    const rerunCheckbox    = el('rerunCheckbox');
-    const shuffleCheckbox  = el('shuffleCheckbox');
-    const newUrlInput      = el('newUrl');
-    const copyBtn          = el('copyBtn');
-    const progressBar      = el('progressBar');
-    const progressText     = el('progressText');
-    const resultsList      = el('results');
-    const controls         = el('controls');
+// Try a list of archive variant URLs, stop after first success (per-task)
+async function tryArchiveVariantUrls(slot, variantUrls, mode) {
+  for (let i=0;i<variantUrls.length;i++){
+    if(!isActive(slot)) return false;
+    const finalUrl = variantUrls[i];
 
-    // ——— UTILITIES —————————————————————————————————————————————————
-    function saveSettings() {
-      document.cookie = `mode=${settings.mode};path=/`;
-      document.cookie = `concurrency=${settings.concurrency};path=/`;
-      document.cookie = `rerun=${settings.rerun};path=/`;
-      document.cookie = `shuffle=${settings.shuffle};path=/`;
-    }
+    const li = document.createElement('li');
+    li.innerHTML = `<a href="${finalUrl}" target="_blank" rel="noreferrer noopener">${finalUrl}</a> <span class="status loading">⏳</span>`;
+    resultsUl.appendChild(li);
+    const statusSpan = li.querySelector('.status');
+    const markThis = ok => { if(!isActive(slot)) return; statusSpan.innerHTML=ok?'✔️':'✖️'; statusSpan.className='status '+(ok?'success':'failure'); };
 
-    function loadSettings() {
-      document.cookie.split(';').forEach(c => {
-        const [k, v] = c.trim().split('=');
-        if (k === 'mode')        settings.mode        = v;
-        if (k === 'concurrency') settings.concurrency = +v;
-        if (k === 'rerun')       settings.rerun       = (v === 'true');
-        if (k === 'shuffle')     settings.shuffle     = (v === 'true');
-      });
-    }
+    if (mode === 'iframe') {
+      const ifr = document.createElement('iframe');
+      ifr.classList.add('hidden-iframe');
+      document.body.appendChild(ifr);
+      activeIframes.add(ifr);
+      let completed = false;
+      let resolver = null;
+      const cleanup = () => { try { ifr.remove(); } catch(e){} activeIframes.delete(ifr); };
 
-    function shuffleArray(arr) {
-      for (let i = arr.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [arr[i], arr[j]] = [arr[j], arr[i]];
-      }
-      return arr;
-    }
-
-    function normalizeUrl(raw) {
-      let u = raw.trim();
-      if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
-      try {
-        const p = new URL(u);
-        p.hostname = p.hostname.replace(/^www\./i, '');
-        if (p.pathname === '/' || !p.pathname) p.pathname = '';
-        return p.toString();
-      } catch {
-        return null;
-      }
-    }
-
-    function extractYouTubeID(u) {
-      try {
-        const p = new URL(u);
-        if (p.hostname.includes('youtube.com') && p.searchParams.get('v'))
-          return p.searchParams.get('v');
-        if (p.hostname === 'youtu.be') return p.pathname.slice(1);
-      } catch {}
-      return null;
-    }
-
-    function buildMap(u, vid) {
-      const p = new URL(u);
-      const parts = p.hostname.split('.'); const ln = parts.length;
-      const domainname = parts.slice(-2, -1)[0]; const tld = parts.slice(-1)[0];
-      const sub = parts.slice(0, ln - 2).join('.');
-      const map = {
-        PROTOCOL:   p.protocol,
-        SUBDOMAIN:  sub ? sub + '.' : '',
-        DOMAINNAME: domainname,
-        TLD:        tld,
-        HOST:       p.hostname,
-        PORT:       p.port ? ':' + p.port : '',
-        PATH:       p.pathname,
-        QUERY:      p.search,
-        PARAMS:     p.search ? p.search.slice(1) : '',
-        FRAGMENT:   p.hash,
-        URL:        u,
-        DOMAIN:     p.hostname
+      ifr.onload = () => {
+        if (completed || !isActive(slot)) return;
+        try {
+          const frameTitle = ifr.contentDocument ? ifr.contentDocument.title : '';
+          if (frameTitle && frameTitle.trim().toLowerCase() === 'welcome to nginx') {
+            completed = true; markThis(false); cleanup(); if (resolver) resolver(); return;
+          }
+        } catch (e) { /* cross-origin; treat onload as success */ }
+        completed = true; markThis(true); cleanup(); if (resolver) resolver();
       };
-      if (vid) map.ID = vid;
-      Object.keys(map).forEach(k => map['ENCODE_' + k] = encodeURIComponent(map[k]));
-      return map;
-    }
 
-    function replacePlaceholders(tpl, map) {
-      return tpl.replace(/\[([A-Z_]+)\]/g, (_, key) => map[key] || '');
-    }
-
-    function updateProgress() {
-      const pct = Math.round(((completed + failed) / total) * 100);
-      progressBar.style.width = pct + '%';
-      progressText.textContent = pct + '%';
-    }
-
-    function showPopupWarning() {
-      if (popupBlocked) return;
-      popupBlocked = true;
-      const msg = document.createElement('div');
-      msg.id = 'popupWarning'; msg.style.color='red'; msg.style.margin='1em 0';
-      msg.textContent = 'Pop-up blocked! Please allow pop-ups to use Popup/Tab mode.';
-      controls.parentNode.insertBefore(msg, controls);
-    }
-
-    // ——— ON COMPLETE ——————————————————————————————————————————————
-    function onComplete() {
-      running = false;
-      urlInput.disabled = false;
-      startBtn.textContent = 'Generate Backlinks';
-      // cleanup
-      slots.forEach(s => {
-        if (settings.mode === 'iframe') s.ref.remove();
-        else if (s.ref && !s.ref.closed) s.ref.close();
+      await new Promise(resolve => {
+        resolver = resolve;
+        try { ifr.src = finalUrl; } catch(e){}
+        slot.timeoutId = setTimeout(() => {
+          if (!completed && isActive(slot)) { markThis(false); cleanup(); }
+          resolve();
+        }, 8000);
       });
-      if (settings.rerun) {
-        startAll();
-      }
+
+      if (statusSpan.classList.contains('success')) return true;
+      continue;
     }
 
-    // ——— SLOT POOL ——————————————————————————————————————————————————
-    function initSlots(map, templates) {
-      currentMap = map;
-      urlQueue = templates.map((tpl, idx) => ({ tpl, idx }));
-      slots = [];
-      for (let i = 0; i < settings.concurrency; i++) {
-        const slot = { id: i, busy: false, ref: null, timeoutId: null, current: null };
-        if (settings.mode === 'iframe') {
-          const iframe = document.createElement('iframe'); iframe.sandbox = 'allow-scripts allow-same-origin';  iframe.style.display = 'none'; document.body.appendChild(iframe);
-          iframe.onload = () => handleIframeLoad(slot);
-          slot.ref = iframe;
+    if (mode === 'popup' || mode === 'tab') {
+      const specs = mode === 'popup' ? 'width=600,height=400' : '';
+      const reuse = (reuseToggle && reuseToggle.value === 'reuse');
+
+      if (reuse) {
+        // Reuse the same named window/tab per slot
+        if (!slot.ref || slot.ref.closed) {
+          slot.ref = window.open('about:blank', 'slot-'+slot.id, specs);
+          if (!slot.ref) { markThis(false); continue; }
+          activeWindows.add(slot.ref);
         }
-        slots.push(slot);
-      }
-      slots.forEach(slot => launchSlot(slot));
-    }
-	
-   
-    function launchSlot(slot) {
-  if (!running || slot.busy) return;
+        let loaded = false;
+        try { slot.ref.onload = () => { loaded = true; }; } catch(eAssign) {}
+        try { slot.ref.location.href = finalUrl; } catch(eSet) {}
 
-  // If queue empty, check for completion
-  if (urlQueue.length === 0) {
-    if (slots.every(s => !s.busy)) onComplete();
+        await new Promise(resolve => {
+          slot.timeoutId = setTimeout(() => {
+            if (!isActive(slot)) return resolve();
+            if (!loaded) { markThis(false); return resolve(); }
+            try {
+              const t = slot.ref.document ? slot.ref.document.title : '';
+              if (t && t.trim().toLowerCase() === 'welcome to nginx') { markThis(false); }
+              else { markThis(true); }
+            } catch (eDoc) {
+              // Cross-origin but onload fired: success
+              markThis(true);
+            }
+            resolve();
+          }, 8000);
+        });
+
+        if (statusSpan.classList.contains('success')) return true;
+      } else {
+        // Fresh window per attempt, then close
+        try {
+          const w = window.open('about:blank', '_blank', specs);
+          if (!w) {
+            markThis(false);
+          } else {
+            activeWindows.add(w);
+            let loaded = false;
+            try { w.onload = () => { loaded = true; }; } catch(eAssign){}
+            try { w.location.href = finalUrl; } catch(eSet){}
+
+            await new Promise(resolve => {
+              slot.timeoutId = setTimeout(() => {
+                if (!isActive(slot)) { try { w.close(); } catch{} activeWindows.delete(w); return resolve(); }
+                if (!loaded) { try { w.close(); } catch{} activeWindows.delete(w); markThis(false); return resolve(); }
+                try {
+                  const t = w.document ? w.document.title : '';
+                  if (t && t.trim().toLowerCase() === 'welcome to nginx') { markThis(false); }
+                  else { markThis(true); }
+                  try { w.close(); } catch{}
+                } catch (eDoc) {
+                  markThis(true);
+                  try { w.close(); } catch{}
+                }
+                activeWindows.delete(w);
+                resolve();
+              }, 8000);
+            });
+
+            if (statusSpan.classList.contains('success')) return true;
+          }
+        } catch { markThis(false); }
+      }
+      continue;
+    }
+
+    if (mode === 'ping') {
+      let ok = false;
+      for (const proxyTpl of corsProxiesTemplates) {
+        if (!isActive(slot)) return false;
+        try {
+          const proxyUrl = generateUrl(proxyTpl, finalUrl);
+          if (!proxyUrl) continue;
+          try {
+            const res = await fetchWithTimeout(proxyUrl, 5000);
+            if (res && res.ok) { ok = true; break; }
+          } catch {}
+        } catch {}
+      }
+      markThis(ok);
+      if (ok) return true;
+      continue;
+    }
+
+    // Fallback direct fetch
+    try {
+      const res = await fetchWithTimeout(finalUrl, 5000);
+      const ok = !!(res && res.ok);
+      markThis(ok);
+      if (ok) return true;
+    } catch {
+      markThis(false);
+    }
+  }
+  return false;
+}
+
+async function launchSlot(slot){
+  if(!isActive(slot)) return;
+  const task = queue.shift();
+  if(!task){
+    if(slots.every(s=>!s.busy)) finishRun();
+    return;
+  }
+  slot.busy=true;
+
+  // Archive variant group task
+  if (task.archiveVariants && task.archiveVariants.length){
+    try { await tryArchiveVariantUrls(slot, task.archiveVariants, task.mode); } catch {}
+    if (!isActive(slot)) return;
+    doneCount++; updateProgress(); slot.busy=false; if (isActive(slot)) launchSlot(slot);
     return;
   }
 
-  // Pull next URL
-  const { tpl, idx } = slot.current = urlQueue.shift();
-  const url = replacePlaceholders(tpl, currentMap);
+  // Normal task
+  const {mode,url} = task;
+  const li=document.createElement('li'); li.innerHTML=`<a href="${url}" target="_blank" rel="noreferrer noopener">${url}</a><span class="status loading">⏳</span>`; resultsUl.appendChild(li);
+  const mark = ok => { if (!isActive(slot)) return; clearTimeout(slot.timeoutId); slot.busy=false; doneCount++; const span=li.querySelector('.status'); span.innerHTML=ok?'✔️':'✖️'; span.className='status '+(ok?'success':'failure'); updateProgress(); if (isActive(slot)) launchSlot(slot); };
 
-  // Update UI to “loading”
-  const status = resultsList.children[idx].querySelector('.status');
-  status.innerHTML = '⏳';
-  status.className = 'status loading';
-  slot.busy = true;
-
-  const timeoutMs = 8000;
-
-  if (settings.mode === 'ping') {
-    // ——— PING MODE —————————————————————————————————————
-    let done = false;
-    // global timeout
-    slot.timeoutId = setTimeout(() => {
-      if (!done) handlePingError(slot, idx);
-    }, timeoutMs);
-
-    (async () => {
-      for (const proxyTpl of corsProxiesTemplates) {
-        const proxyUrl = replacePlaceholders(proxyTpl, currentMap);
-        try {
-          const res = await fetch(proxyUrl);
-          if (res.ok) {
-            done = true;
-            clearTimeout(slot.timeoutId);
-            handlePingComplete(slot, idx);
-            break;
-          }
-        } catch (e) {
-          // try next proxy
-        }
+  if (mode === 'iframe') {
+    const ifr = document.createElement('iframe');
+    ifr.classList.add('hidden-iframe');
+    document.body.appendChild(ifr);
+    activeIframes.add(ifr);
+    const cleanup = () => { try{ ifr.remove(); }catch(e){} activeIframes.delete(ifr); };
+    ifr.onload = () => { if (isActive(slot)) { clearTimeout(slot.timeoutId); cleanup(); mark(true); } else { cleanup(); } };
+    slot.timeoutId = setTimeout(() => { cleanup(); mark(false); }, 8000);
+    ifr.src = url;
+    return;
+  } else if(mode==='popup' || mode==='tab'){
+    const specs = mode==='popup' ? 'width=600,height=400' : '';
+    if(reuseToggle.value==='fresh'){
+      const w = window.open('about:blank','_blank',specs); if(!w){ alert('Pop-up blocked!'); mark(false); return; }
+      activeWindows.add(w);
+      w.location.href = url;
+      slot.timeoutId = setTimeout(()=>{ try{ w.close(); }catch(e){} activeWindows.delete(w); mark(true); },8000);
+    } else {
+      if(!slot.ref || slot.ref.closed){
+        slot.ref = window.open('about:blank','slot-'+slot.id,specs);
+        if(!slot.ref){ alert('Pop-up blocked!'); mark(false); return; }
       }
-      if (!done) {
-        clearTimeout(slot.timeoutId);
-        handlePingError(slot, idx);
-      }
-    })();
-
-  } else if (settings.mode === 'iframe') {
-    // **REUSE** the pre‑created iframe (slot.ref) from initSlots()
-    const iframe = slot.ref;
-
-    // Clear any previous handlers/timeouts
-    iframe.onload = null;
-    clearTimeout(slot.timeoutId);
-
-    // Set up new load handler
-    iframe.onload = () => {
-      clearTimeout(slot.timeoutId);
-      handleIframeLoad(slot);
-    };
-
-    // Start timeout
-    slot.timeoutId = setTimeout(() => {
-      iframe.onload = null;
-      handleIframeError(slot);
-    }, timeoutMs);
-
-    // Kick off load
-    iframe.src = url;
-
-  } else {
-    // Popup/Tab mode — reuse slot.ref if already open, otherwise open once
-    const name  = `slotWin_${slot.id}`;
-  
-    const specs = settings.mode === 'popup'
-      ? 'width=600,height=400,toolbar=no,location=no,status=no,menubar=no,scrollbars=yes,resizable=yes'
-      : '';
-
-    let win = slot.ref;
-    if (!win || win.closed) {
-      // open fresh if needed
-      win = window.open('about:blank', name, specs);
-      if (!win) {
-        showPopupWarning();
-        handlePopupError(slot);
-        return;
-      }
-      slot.ref = win;
-      // Optionally disable further popups from inside:
-      try { win.onload = () => { win.open = () => null; }; } catch {}
+      activeWindows.add(slot.ref);
+      slot.ref.location.href = url;
+      slot.timeoutId = setTimeout(()=>{ activeWindows.delete(slot.ref); mark(true); },8000);
     }
 
-    // Clear any previous timeout/poll
-    clearTimeout(slot.timeoutId);
-
-    // Navigate it
-    try { win.location.href = url; } catch {}
-
-    // Listen for real load if same‑origin
-    let loaded = false;
-    try {
-      win.addEventListener('load', () => {
-        if (loaded) return;
-        loaded = true;
-        clearTimeout(slot.timeoutId);
-        handlePopupComplete(slot);
-      });
-    } catch {}
-
-    // Poll readyState every 200ms (same‑origin only)
-    const pollId = setInterval(() => {
+  } else if(mode==='ping'){
+    const PROXY_TIMEOUT = 5000;
+    let ok=false;
+    for (const tpl of corsProxiesTemplates) {
+      if (!isActive(slot)) return;
       try {
-        if (win.document.readyState === 'complete') {
-          clearInterval(pollId);
-          if (!loaded) {
-            loaded = true;
-            clearTimeout(slot.timeoutId);
-            handlePopupComplete(slot);
-          }
-        }
-      } catch {
-        clearInterval(pollId);
-      }
-    }, 200);
-
-    // Fallback timeout
-    slot.timeoutId = setTimeout(() => {
-      clearInterval(pollId);
-      if (!loaded) handlePopupError(slot);
-    }, timeoutMs);
+        const proxyUrl = generateUrl(tpl, url);
+        if (!proxyUrl) continue;
+        try {
+          const res = await fetchWithTimeout(proxyUrl, PROXY_TIMEOUT);
+          if (res && res.ok) { ok = true; break; }
+        } catch {}
+      } catch {}
+    }
+    mark(ok);
+  } else {
+    try {
+      const res = await fetchWithTimeout(url, 5000);
+      mark(res && res.ok);
+    } catch (e) {
+      mark(false);
+    }
   }
 }
 
-// You’ll need two new handlers alongside your existing ones:
+function startRun(){
+  const raw = urlInput.value.trim()||location.search.slice(1);
+  const norm = normalizeUrl(raw); if(!norm){ alert('Invalid URL'); return; }
+  setExternalLink("Open URL", raw);
+  urlInput.value = norm; saveSettings();
 
-function handlePingComplete(slot, idx) {
-  const status = resultsList.children[idx].querySelector('.status');
-  status.innerHTML = '✓';
-  status.className = 'status success';
-  completed++;
+  // Reset run state
+  runToken++;
+  const thisToken = runToken;
+  running=true; queue=[];
+  slots.forEach(s=>{ try{ s.ref && s.ref.close(); }catch(e){}; });
+  resultsUl.innerHTML=''; totalTasks=0; doneCount=0;
+
+  if (rerunTimer) { clearTimeout(rerunTimer); rerunTimer = null; }
+
+  const vid = new URL(norm).searchParams.get('v');
+  let templates = vid ? [...youtubeBacklinkTemplates,'https://web.archive.org/save/[URL]'] : backlinkTemplates.slice();
+  if (shuffleCheckbox.checked) templates.sort(()=>Math.random()-0.5);
+
+  // NEW: avoid duplicate archive groups (same path+query across archive TLDs)
+  const archiveGroupKeys = new Set();
+
+  // Build queue with generalized archive variant grouping
+  const mode = modeSelect.value;
+  for (const tpl of templates){
+    try {
+      const finalUrl = generateUrl(tpl, norm, vid);
+      if (!finalUrl || !finalUrl.trim()) continue;
+
+      let isArchive = false, u = null;
+      try { u = new URL(finalUrl); isArchive = isArchiveHost(u.hostname); } catch {}
+
+      if (isArchive) {
+        // Key = protocol + path + search + hash, but WITHOUT hostname (so TLD variants are the same group)
+        const groupKey = `${u.protocol}//${u.pathname}${u.search}${u.hash}`;
+        if (archiveGroupKeys.has(groupKey)) {
+          // duplicate group → skip
+          continue;
+        }
+        archiveGroupKeys.add(groupKey);
+
+        const variants = buildArchiveUrlVariants(finalUrl);
+        if (variants && variants.length) {
+          queue.push({ mode, archiveVariants: variants });
+          continue;
+        }
+      }
+
+      // Non-archive or no variants built
+      queue.push({ mode, url: finalUrl });
+    } catch {}
+  }
+
+  totalTasks = queue.length;
   updateProgress();
-  slot.busy = false;
-  launchSlot(slot);
+  newUrlInput.value = location.origin + '?' + norm;
+  window.history.replaceState(null, '', location.pathname + '?' + norm);
+  slots = Array.from({length:+concurrencyRange.value},(_,i)=>({id:i,busy:false,ref:null,timeoutId:null,token:thisToken}));
+  slots.forEach(s=>launchSlot(s)); startBtn.textContent='Stop';
 }
 
-function handlePingError(slot, idx) {
-  const status = resultsList.children[idx].querySelector('.status');
-  status.innerHTML = '✗';
-  status.className = 'status failure';
-  failed++;
-  updateProgress();
-  slot.busy = false;
-  launchSlot(slot);
+
+function finishRun(){
+  if (!running) return;
+  running=false; startBtn.textContent='Generate Backlinks';
+  slots.forEach(s=>{ try{ s.ref && s.ref.close(); }catch(e){}; s.timeoutId && clearTimeout(s.timeoutId); s.timeoutId=null; });
+  if(rerunCheckbox.checked){
+    rerunTimer = setTimeout(startRun,500);
+  }
 }
-    
-    function handleIframeLoad(slot) {
-      clearTimeout(slot.timeoutId); const idx=slot.current.idx;
-      const status = resultsList.children[idx].querySelector('.status'); status.innerHTML='✓'; status.className='status success';
-      completed++; updateProgress(); slot.busy=false; launchSlot(slot);
-    }
-    function handleIframeError(slot) {
-      clearTimeout(slot.timeoutId); const idx=slot.current.idx;
-      const status = resultsList.children[idx].querySelector('.status'); status.innerHTML='✗'; status.className='status failure';
-      failed++; updateProgress(); slot.busy=false; launchSlot(slot);
-    }
-    function handlePopupComplete(slot) {
-      clearTimeout(slot.timeoutId); const idx=slot.current.idx;
-      const status = resultsList.children[idx].querySelector('.status'); status.innerHTML='✓'; status.className='status success';
-      completed++; updateProgress(); slot.busy=false; launchSlot(slot);
-    }
-    function handlePopupError(slot) {
-      clearTimeout(slot.timeoutId); const idx=slot.current.idx;
-      const status = resultsList.children[idx].querySelector('.status'); status.innerHTML='✗'; status.className='status failure';
-      failed++; updateProgress(); slot.busy=false; launchSlot(slot);
-    }
 
-    // ——— START & STOP —————————————————————————————————————————————————
-    function startAll() {
-      const normalized = normalizeUrl(urlInput.value);
-      if (!normalized) { alert('Invalid URL'); return; }
-      const vid = extractYouTubeID(normalized);
-      let templates = vid ? youtubeBacklinkTemplates : backlinkTemplates;
-      if (settings.shuffle) templates = shuffleArray(templates.slice());
-      currentMap = buildMap(normalized, vid);
-
-      running = true; total = templates.length; completed = failed = 0;
-      resultsList.innerHTML = '';
-      progressBar.style.width = '0%'; progressText.textContent = '0%';
-
-      templates.forEach((tpl, idx) => {
-        const u = replacePlaceholders(tpl, currentMap);
-        const li = document.createElement('li');
-        li.innerHTML = `<a href="${u}" target="_blank">${u}</a><span class=\"status\">…</span>`;
-        resultsList.appendChild(li);
-      });
-
-      urlInput.disabled = true; startBtn.textContent='Stop';
-      // share URL
-      const shareStr = `${location.origin}${location.pathname}?${normalized}`;
-      newUrlInput.value = shareStr; history.replaceState(null,'',`${location.pathname}?${normalized}`);
-
-      settings.rerun = rerunCheckbox.checked;
-      initSlots(currentMap, templates);
-    }
-
-    function stopAll() {
-      running = false; urlInput.disabled=false; startBtn.textContent='Generate Backlinks';
-      slots.forEach(s => { if (!s.ref) return; if (settings.mode==='iframe') s.ref.remove(); else if (!s.ref.closed) s.ref.close(); });
-      slots=[]; urlQueue=[];
-    }
-
-    // ——— UI INITIALIZATION —————————————————————————————————————
-    function init() {
-      loadSettings(); advPanel.style.display='none';
-      modeSelect.value=settings.mode; concurrencyRange.value=settings.concurrency;
-      concurrentCount.textContent=settings.concurrency;
-      rerunCheckbox.checked=settings.rerun; shuffleCheckbox.checked=settings.shuffle;
-      toggleBtn.addEventListener('click',()=>{ const hid=advPanel.style.display==='none'; advPanel.style.display=hid?'block':'none'; toggleBtn.innerHTML=hid?'⚙️ Advanced ▲':'⚙️ Advanced ▼'; });
-      modeSelect.addEventListener('change',()=>{settings.mode=modeSelect.value;saveSettings();});
-      concurrencyRange.addEventListener('input',()=>{settings.concurrency=+concurrencyRange.value;concurrentCount.textContent=settings.concurrency;saveSettings();});
-      rerunCheckbox.addEventListener('change',()=>{/* noop—read in startAll */});
-      shuffleCheckbox.addEventListener('change',()=>{settings.shuffle=shuffleCheckbox.checked;saveSettings();});
-      startBtn.addEventListener('click',()=>running?stopAll():startAll());
-      newUrlInput.addEventListener('click',()=>newUrlInput.select());
-      copyBtn.addEventListener('click',()=>{newUrlInput.select();document.execCommand('copy');});
-      const q=window.location.search.slice(1); if(q){urlInput.value=q;startAll();}
-    }
-
-    init();
+function stopRun(){
+  running=false; queue=[]; startBtn.textContent='Generate Backlinks';
+  if (rerunTimer) { clearTimeout(rerunTimer); rerunTimer=null; }
+  slots.forEach(s=>{
+    if (s.timeoutId){ try{ clearTimeout(s.timeoutId); }catch(e){}; s.timeoutId=null; }
+    try { s.ref && s.ref.close(); } catch(e){}
   });
-})();
+  activeWindows.forEach(w=>{ try{ w.close(); }catch(e){} });
+  activeWindows.clear();
+  activeIframes.forEach(ifr=>{ try{ ifr.remove(); }catch(e){} });
+  activeIframes.clear();
+}
+
+downloadBtn.addEventListener('click',()=>{
+  const raw = urlInput.value.trim(), norm = normalizeUrl(raw); if(!norm){ alert('Invalid URL'); return; }
+  const vid=new URL(norm).searchParams.get('v');
+  let templates = vid ? [...youtubeBacklinkTemplates,'https://web.archive.org/save/[URL]'] : backlinkTemplates.slice();
+  if(shuffleCheckbox.checked) templates.sort(()=>Math.random()-0.5);
+  const urls = templates.map(tpl => {
+    try { return generateUrl(tpl, norm, vid); } catch { return ''; }
+  }).filter(Boolean);
+  const blob=new Blob([urls.join('\n')],{type:'text/plain'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='backlinks.txt'; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+});
+
+window.addEventListener('DOMContentLoaded', async()=>{
+  loadSettings(); await loadTemplates();
+  updateReuseToggleState();
+  const param=location.search.slice(1);
+  if(param){
+    const norm=normalizeUrl(param);
+    if(norm){
+      urlInput.value=norm;
+      startRun();
+    } else alert('Invalid URL');
+  } else {
+    const here = window.location.href.split('#')[0];
+    const testUrl = here + (here.includes('?') ? '&' : '?') + here;
+    setExternalLink("Open Test", testUrl);
+  }
+});
+
+function setExternalLink(txt, href){
+  const linkEl = externalLink || document.getElementById('externalLink');
+  if(!linkEl) return;
+  linkEl.href = href;
+  linkEl.style.display = "inline-block";
+  try { linkEl.innerHTML = "🔗 " + txt + " → " + (new URL(href)).hostname; } catch { linkEl.innerHTML = "🔗 " + txt; }
+}
