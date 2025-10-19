@@ -1,4 +1,3 @@
-<script>
 /*
     ✅ Things to check if it still doesn’t work:
     
@@ -76,4 +75,3 @@
       setRandomUrlInIframes();
       setInterval(setRandomUrlInIframes, 15000);
     });
-</script>
